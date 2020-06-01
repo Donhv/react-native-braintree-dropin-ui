@@ -2,6 +2,15 @@ package tech.power.RNBraintreeDropIn;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.util.Log;
+
+import com.braintreepayments.api.BraintreeFragment;
+import com.braintreepayments.api.PaymentMethod;
+import com.braintreepayments.api.exceptions.InvalidArgumentException;
+import com.braintreepayments.api.interfaces.PaymentMethodNoncesUpdatedListener;
+import com.braintreepayments.api.models.ThreeDSecureAdditionalInformation;
+import com.braintreepayments.api.models.ThreeDSecurePostalAddress;
+import com.braintreepayments.api.models.ThreeDSecureRequest;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
@@ -21,27 +30,53 @@ import com.braintreepayments.api.models.GooglePaymentRequest;
 import com.google.android.gms.wallet.TransactionInfo;
 import com.google.android.gms.wallet.WalletConstants;
 
-public class RNBraintreeDropInModule extends ReactContextBaseJavaModule {
+import java.util.ArrayList;
+import java.util.List;
 
+import androidx.appcompat.app.AppCompatActivity;
+
+public class RNBraintreeDropInModule extends ReactContextBaseJavaModule {
   private Promise mPromise;
   private static final int DROP_IN_REQUEST = 0x444;
 
   private boolean isVerifyingThreeDSecure = false;
-
+  ArrayList<String> recentNonces = new ArrayList<String>() ;
   public RNBraintreeDropInModule(ReactApplicationContext reactContext) {
     super(reactContext);
     reactContext.addActivityEventListener(mActivityListener);
   }
 
   @ReactMethod
+  public void getListNonce(final ReadableMap options,final Promise promise) {
+    recentNonces.clear();
+    final WritableMap jsResult = Arguments.createMap();
+    final String token = options.getString("clientToken");
+    PaymentMethodNoncesUpdatedListener paymentMethodNoncesUpdatedListener = new PaymentMethodNoncesUpdatedListener() {
+      @Override
+      public void onPaymentMethodNoncesUpdated(List<PaymentMethodNonce> paymentMethodNonces) {
+        for (PaymentMethodNonce paymentMethodNonce : paymentMethodNonces) {
+          recentNonces.add(paymentMethodNonce.getNonce());
+        }
+        promise.resolve(jsResult);
+      }
+    };
+    try {
+      BraintreeFragment mFragment = BraintreeFragment.newInstance((AppCompatActivity) getCurrentActivity(),token);
+      mFragment.addListener(paymentMethodNoncesUpdatedListener);
+      PaymentMethod.getPaymentMethodNonces(mFragment);
+    } catch (InvalidArgumentException e) {
+      promise.resolve(jsResult);
+      e.printStackTrace();
+    }
+  }
+
+  @ReactMethod
   public void show(final ReadableMap options, final Promise promise) {
     isVerifyingThreeDSecure = false;
-
     if (!options.hasKey("clientToken")) {
       promise.reject("NO_CLIENT_TOKEN", "You must provide a client token");
       return;
     }
-
     Activity currentActivity = getCurrentActivity();
     if (currentActivity == null) {
       promise.reject("NO_ACTIVITY", "There is no current activity");
@@ -49,11 +84,6 @@ public class RNBraintreeDropInModule extends ReactContextBaseJavaModule {
     }
 
     DropInRequest dropInRequest = new DropInRequest().clientToken(options.getString("clientToken"));
-
-    if(options.hasKey("vaultManager")) {
-      dropInRequest.vaultManager(options.getBoolean("vaultManager"));
-    }
-
     dropInRequest.collectDeviceData(true);
 
     if(options.getBoolean("googlePay")){
@@ -62,9 +92,7 @@ public class RNBraintreeDropInModule extends ReactContextBaseJavaModule {
           .setTotalPrice(options.getString("orderTotal"))
           .setTotalPriceStatus(WalletConstants.TOTAL_PRICE_STATUS_FINAL)
           .setCurrencyCode(options.getString("currencyCode"))
-          .build())
-          .billingAddressRequired(true)
-          .googleMerchantId(options.getString("googlePayMerchantId"));
+          .build());
 
       dropInRequest.googlePaymentRequest(googlePaymentRequest);
     }
@@ -76,17 +104,20 @@ public class RNBraintreeDropInModule extends ReactContextBaseJavaModule {
         promise.reject("NO_3DS_AMOUNT", "You must provide an amount for 3D Secure");
         return;
       }
-
+      ThreeDSecureRequest threeDSecureRequest = new ThreeDSecureRequest()
+              .amount(String.valueOf(threeDSecureOptions.getDouble("amount")))
+    .versionRequested(ThreeDSecureRequest.VERSION_2);
       isVerifyingThreeDSecure = true;
 
       dropInRequest
-      .amount(String.valueOf(threeDSecureOptions.getDouble("amount")))
-      .requestThreeDSecureVerification(true);
+      .requestThreeDSecureVerification(true)
+              .threeDSecureRequest(threeDSecureRequest);
     }
-
+    dropInRequest.vaultManager(true);
     mPromise = promise;
     currentActivity.startActivityForResult(dropInRequest.getIntent(currentActivity), DROP_IN_REQUEST);
   }
+
 
   private final ActivityEventListener mActivityListener = new BaseActivityEventListener() {
     @Override
@@ -101,7 +132,6 @@ public class RNBraintreeDropInModule extends ReactContextBaseJavaModule {
         DropInResult result = data.getParcelableExtra(DropInResult.EXTRA_DROP_IN_RESULT);
         PaymentMethodNonce paymentMethodNonce = result.getPaymentMethodNonce();
         String deviceData = result.getDeviceData();
-
         if (isVerifyingThreeDSecure && paymentMethodNonce instanceof CardNonce) {
           CardNonce cardNonce = (CardNonce) paymentMethodNonce;
           ThreeDSecureInfo threeDSecureInfo = cardNonce.getThreeDSecureInfo();
@@ -128,12 +158,15 @@ public class RNBraintreeDropInModule extends ReactContextBaseJavaModule {
 
   private final void resolvePayment(PaymentMethodNonce paymentMethodNonce, String deviceData) {
     WritableMap jsResult = Arguments.createMap();
+    String nonce = paymentMethodNonce.getNonce();
+    String type = paymentMethodNonce.getTypeLabel();
+
     jsResult.putString("nonce", paymentMethodNonce.getNonce());
-    jsResult.putString("type", paymentMethodNonce.getTypeLabel());
+    jsResult.putString("type", type);
     jsResult.putString("description", paymentMethodNonce.getDescription());
     jsResult.putBoolean("isDefault", paymentMethodNonce.isDefault());
     jsResult.putString("deviceData", deviceData);
-
+    jsResult.putBoolean("isRecent", type == "Google Pay" ? true : recentNonces.contains(nonce));
     mPromise.resolve(jsResult);
   }
 
@@ -141,4 +174,5 @@ public class RNBraintreeDropInModule extends ReactContextBaseJavaModule {
   public String getName() {
     return "RNBraintreeDropIn";
   }
+
 }
